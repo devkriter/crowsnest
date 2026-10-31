@@ -59,11 +59,12 @@ jobs:
           if git merge --no-edit -m "Merge $UPSTREAM_REPO@$UPSTREAM_BRANCH" "$up"; then
             git push --force origin "$SYNC"
             body=$(printf 'Automated merge of new upstream commits into `%s`.\n\n%s\n\n%s' "$BASE" "$commits" "$AFTER_MERGE")
-            pr=$(gh pr list --head "$SYNC" --base "$BASE" --state open --json number --jq '.[0].number')
+            # REST, not gh pr/issue: their GraphQL calls are refused for GITHUB_TOKEN here.
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&base=$BASE&head=$GITHUB_REPOSITORY_OWNER:$SYNC" --jq '.[0].number // empty')
             if [ -z "$pr" ]; then
-              gh pr create --base "$BASE" --head "$SYNC" --title "$title" --body "$body"
+              gh api "repos/$GITHUB_REPOSITORY/pulls" -f base="$BASE" -f head="$SYNC" -f title="$title" -f body="$body" --jq .html_url
             else
-              gh pr edit "$pr" --title "$title" --body "$body"
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$pr" -f title="$title" -f body="$body" --jq .html_url
             fi
             if [ -n "$BUILD_WORKFLOW" ]; then
               gh workflow run "$BUILD_WORKFLOW" --ref "$SYNC"
@@ -73,10 +74,10 @@ jobs:
             git merge --abort
             body=$(printf 'Merging %s@%s into `%s` conflicts in:\n\n%s\n\nNew upstream commits:\n\n%s\n\nResolve by hand: `git fetch upstream && git merge upstream/%s` on `%s`.' \
               "$UPSTREAM_REPO" "$UPSTREAM_BRANCH" "$BASE" "$conflicts" "$commits" "$UPSTREAM_BRANCH" "$BASE")
-            issue=$(gh issue list --state open --search "in:title \"Upstream merge conflict\"" --json number --jq '.[0].number')
+            issue=$(gh api "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" --jq '[.[] | select(.pull_request == null and (.title | startswith("Upstream merge conflict")))][0].number // empty')
             if [ -z "$issue" ]; then
-              gh issue create --title "Upstream merge conflict: $UPSTREAM_REPO@$UPSTREAM_BRANCH" --body "$body"
+              gh api "repos/$GITHUB_REPOSITORY/issues" -f title="Upstream merge conflict: $UPSTREAM_REPO@$UPSTREAM_BRANCH" -f body="$body" --jq .html_url
             else
-              gh issue comment "$issue" --body "$body"
+              gh api "repos/$GITHUB_REPOSITORY/issues/$issue/comments" -f body="$body" --jq .html_url
             fi
           fi
