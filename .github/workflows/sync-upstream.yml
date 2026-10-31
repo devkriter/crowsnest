@@ -1,0 +1,82 @@
+# Fork maintenance: merge new upstream commits into the micron branch via a PR.
+# Weekly (and on demand): if upstream has new commits, merge them into
+# sync/upstream and open/update a PR into micron. On a merge conflict, open an
+# issue instead. Nothing lands on micron until the PR is merged by hand.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'  # Mondays 06:17 UTC
+  workflow_dispatch:
+    inputs:
+      upstream_branch:
+        description: Upstream branch to merge (leave empty for the default)
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+concurrency: sync-upstream
+
+env:
+  UPSTREAM_REPO: mainsail-crew/crowsnest
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'master' }}
+  BASE: micron
+  SYNC: sync/upstream
+  BUILD_WORKFLOW: ''  # dispatched on the sync branch; empty to skip
+  AFTER_MERGE: 'After merging, Mainsail/Moonraker offers the Crowsnest update.'
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE }}
+          fetch-depth: 0
+
+      - name: Merge upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          up="upstream/$UPSTREAM_BRANCH"
+
+          behind=$(git rev-list --count "HEAD..$up")
+          if [ "$behind" = 0 ]; then
+            echo "$BASE already contains $UPSTREAM_REPO@$UPSTREAM_BRANCH."
+            exit 0
+          fi
+          commits=$(git log --format="- \`%h\` %s (%an, %ad)" --date=short "HEAD..$up")
+          title="Sync $UPSTREAM_REPO@$UPSTREAM_BRANCH ($behind new commit(s))"
+
+          git checkout -B "$SYNC"
+          if git merge --no-edit -m "Merge $UPSTREAM_REPO@$UPSTREAM_BRANCH" "$up"; then
+            git push --force origin "$SYNC"
+            body=$(printf 'Automated merge of new upstream commits into `%s`.\n\n%s\n\n%s' "$BASE" "$commits" "$AFTER_MERGE")
+            pr=$(gh pr list --head "$SYNC" --base "$BASE" --state open --json number --jq '.[0].number')
+            if [ -z "$pr" ]; then
+              gh pr create --base "$BASE" --head "$SYNC" --title "$title" --body "$body"
+            else
+              gh pr edit "$pr" --title "$title" --body "$body"
+            fi
+            if [ -n "$BUILD_WORKFLOW" ]; then
+              gh workflow run "$BUILD_WORKFLOW" --ref "$SYNC"
+            fi
+          else
+            conflicts=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+            git merge --abort
+            body=$(printf 'Merging %s@%s into `%s` conflicts in:\n\n%s\n\nNew upstream commits:\n\n%s\n\nResolve by hand: `git fetch upstream && git merge upstream/%s` on `%s`.' \
+              "$UPSTREAM_REPO" "$UPSTREAM_BRANCH" "$BASE" "$conflicts" "$commits" "$UPSTREAM_BRANCH" "$BASE")
+            issue=$(gh issue list --state open --search "in:title \"Upstream merge conflict\"" --json number --jq '.[0].number')
+            if [ -z "$issue" ]; then
+              gh issue create --title "Upstream merge conflict: $UPSTREAM_REPO@$UPSTREAM_BRANCH" --body "$body"
+            else
+              gh issue comment "$issue" --body "$body"
+            fi
+          fi
